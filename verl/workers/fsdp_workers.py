@@ -90,11 +90,94 @@ from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+
+import math
+from torch import nn
+
+class ERA(nn.Module):
+    def __init__(self, H_tau_min, n_samples, topp):
+        super().__init__()
+        self._tau = 3
+        self.H_tau_min = H_tau_min
+        self.n_samples = n_samples
+        self.topp = topp
+
+        self.upper_bound = math.log(self._tau) / self._tau
+        assert H_tau_min >= self.upper_bound
+        self.slope = torch.zeros(n_samples + 1)
+        self.b = torch.zeros(n_samples + 1)
+        self.slope[1] = 0
+        self.b[1] = self.upper_bound
+        for n in range(2, n_samples + 1):
+            self.slope[n] = (self.upper_bound - H_tau_min / n) / (1 - 1 / n)
+            self.b[n] = (H_tau_min - self.slope[n]) / n
+
+    def forward(self, x):
+        topk_values, topk_indices = torch.topk(x, k=self.n_samples, dim=-1)
+        probs = topk_values.softmax(dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        mask = cum_probs >= self.topp
+        mask[:, self.n_samples - 1] = 1
+        indices = self.n_samples - mask.int().sum(dim=-1, keepdim=True)
+        # indices = mask.int().argmax(dim=-1, keepdim=True)
+        k_per_sample = indices + 1
+        k_per_sample = torch.clamp(k_per_sample, min=1, max=self.n_samples)
+        print(k_per_sample.squeeze(-1))
+        # device = x.device
+        # slope = self.slope.to(device)
+        # b = self.b.to(device)
+        # slope_per_sample = slope[k_per_sample.squeeze(-1)].unsqueeze(-1)
+        # b_per_sample = b[k_per_sample.squeeze(-1)].unsqueeze(-1)
+
+        dynamic_k_mask = torch.arange(self.n_samples, device=x.device) < k_per_sample
+        selected_probs = torch.where(
+            dynamic_k_mask,
+            sorted_probs,
+            torch.zeros_like(sorted_probs)
+        )
+
+        # denom = selected_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        # selected_probs = selected_probs / denom
+        # print("#0:", selected_probs[0][0])
+        # if len(selected_probs[0]) > 1:
+        #     print("#1:", selected_probs[0][1])
+        # if len(selected_probs[0]) > 2:
+        #     print("#2:", selected_probs[0][2])
+
+        # h = slope_per_sample * selected_probs + b_per_sample
+        # h = h - h.detach() + torch.clamp(h, min=1e-8, max=self.upper_bound - 1e-8).detach()
+        # u = -1 - torch.log(h)
+        # new_logits = (-1 - torch.sqrt(2 * u) - 3/4 * u)
+        # new_logits = new_logits.to(x.dtype)
+        new_logits = topk_values.sort(dim=-1, descending=True)[0]
+        # new_logits = torch.log(selected_probs + 1e-10)
+        new_logits = new_logits.to(x.dtype)
+        # print(sorted_probs[0][2] - new_logits[0][2].softmax(dim=-1))
+
+        max_values = torch.max(x, dim=-1, keepdim=True).values.detach()
+        x = x - max_values - 1000
+        min_values = torch.gather(new_logits, dim=-1, index=k_per_sample - 1).detach()
+        new_logits = new_logits - min_values
+
+        final_indices = torch.gather(topk_indices, -1, sorted_indices)
+        final_values = torch.where(
+            dynamic_k_mask,
+            new_logits,
+            -1000
+        )
+        x.scatter_(-1, final_indices, final_values)
+
+        # print(probs[0][0] - torch.topk(x[0][0], k=self.n_samples, dim=-1)[0].softmax(dim=-1))
+
+        return x
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
@@ -783,9 +866,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
-            actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            OmegaConf.set_struct(self.config.actor, True)
+            with open_dict(self.config.actor):
+                self.config.actor.use_remove_padding = use_remove_padding
+                self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
 
         if self._is_rollout:
@@ -954,8 +1040,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
+            apply_topk = self.config.actor.topk
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if self.config.actor.policy_loss.loss_mode == "era":
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, apply_topk=apply_topk, apply_era=True, era_lb=self.config.actor.era_lb, era_ub=self.config.actor.era_ub, era_k=self.config.actor.era_k)
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, apply_topk=apply_topk)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
